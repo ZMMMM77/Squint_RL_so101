@@ -331,7 +331,7 @@ def so101_place_cube_pixels_env(
 
   rewards = {
       # 1. reach the cube, 2. close the gripper on it, 3. lift it,
-      # 4. carry it over the box (coarse + fine) -- all off once it is in the box.
+      # 4. carry it over the box (far / mid / fine) -- all off once it is in the box.
       "reaching": config.Reward(
           reward_reaching, ee_xpos_key="ee/xpos", cube_xpos_key=CUBE_POS,
           reaching_std=0.05, weight=1.0,
@@ -345,17 +345,27 @@ def so101_place_cube_pixels_env(
           reward_lift, cube_xpos_key=CUBE_POS,
           target_xpos_key="target/mocap_pos", table_z=table_z, weight=3.0,
       ),
+      # The goal is 23-33 cm (horizontally) from where the cube is lifted, so the
+      # far term needs a wide std: with only std=0.08 it is ~1e-4 there and the
+      # first run (so101_place_20261122_105005) never learned to carry the cube
+      # toward the box (it parked it on the far side instead).
       "bringing": config.Reward(
           reward_bringing, cube_xpos_key=CUBE_POS,
-          target_xpos_key="target/mocap_pos", table_z=table_z, std=0.08, weight=3.0,
+          target_xpos_key="target/mocap_pos", table_z=table_z, std=0.25, weight=3.0,
+      ),
+      "bringing_mid": config.Reward(
+          reward_bringing, cube_xpos_key=CUBE_POS,
+          target_xpos_key="target/mocap_pos", table_z=table_z, std=0.08, weight=2.0,
       ),
       "bringing_fine": config.Reward(
           reward_bringing, cube_xpos_key=CUBE_POS,
           target_xpos_key="target/mocap_pos", table_z=table_z, std=0.02, weight=2.0,
       ),
       # 5. open over the box, 6. cube in the box, 7. let go and lift clear.
+      # Holding at the goal pays at most ~13.5 per step (terms 1-4 + posture);
+      # cube in the box with the gripper open pays ~19, so releasing wins.
       "release": config.Reward(reward_release_over_box, weight=2.0),
-      "in_box": config.Reward(reward_in_box, weight=12.0),
+      "in_box": config.Reward(reward_in_box, weight=15.0),
       "released": config.Reward(reward_released_in_box, weight=2.0),
       "retreat": config.Reward(reward_retreat, weight=1.0),
       # Posture: gripper pointing down, jaws closing left-right.

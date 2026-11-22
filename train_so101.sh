@@ -10,6 +10,9 @@
 #   ./train_so101.sh log                         follow the training log (Ctrl+C only stops viewing)
 #   ./train_so101.sh stop                        stop training (checkpoints are kept)
 #   ./train_so101.sh resume [run] [iterations]   continue a run from its latest checkpoint
+#   ./train_so101.sh finetune <run> [iterations] [model_N.pt]
+#                                                new run whose policy starts from <run>'s checkpoint
+#                                                (default: latest; critic starts fresh; default 2000 iterations)
 #   ./train_so101.sh list                        list runs
 #   ./train_so101.sh board [stop]                live training curves in the browser (TensorBoard, port 6006)
 #
@@ -67,9 +70,13 @@ launch() {  # run env nworld iters [resume_ckpt]
   local args=(python -m mujoco_playground.rl.rsl_rl.train --alsologtostderr "--env=$env"
               "--logdir=../$RUNS/$run" "--wp_kernel_cache_dir=$WARP_CACHE"
               "--overrides={\"nworld\": $nworld, \"max_iterations\": $iters}")
-  [[ -n "$ckpt" ]] && args+=("--resume_path=../$RUNS/$run/$ckpt")
+  # ckpt is model_N.pt of this run, or <other_run>/model_N.pt (finetune).
+  if [[ -n "$ckpt" ]]; then
+    if [[ $ckpt == */* ]]; then args+=("--resume_path=../$RUNS/$ckpt"); else args+=("--resume_path=../$RUNS/$run/$ckpt"); fi
+  fi
   mkdir -p "$RUNS/$run"
   printf 'env=%s\nnworld=%s\n' "$env" "$nworld" > "$RUNS/$run/run.cfg"
+  if [[ $ckpt == */* ]]; then printf 'init=%s\n' "$ckpt" >> "$RUNS/$run/run.cfg"; fi
   echo "=== $(date '+%F %T') start: ${args[*]}" >> "$RUNS/$run/train.log"
   # setsid+nohup: training keeps going if this terminal or Claude disconnects.
   WSL_GPU_JOB_ID=$run setsid nohup ./wsl-gpu "${args[@]}" >> "$RUNS/$run/train.log" 2>&1 < /dev/null &
@@ -102,6 +109,17 @@ case "${1:-}" in
     case $env in $VISION_ENV) def=$VISION_ITERS ;; $PLACE_ENV) def=$PLACE_ITERS ;; *) def=$STATE_ITERS ;; esac
     echo "Resuming $run from model_$ckpt.pt"
     launch "$run" "$env" "$nworld" "${3:-$def}" "model_$ckpt.pt" ;;
+  finetune)
+    src=${2:-}
+    [[ -n "$src" && -d "$RUNS/$src" ]] || { echo "usage: $0 finetune <from_run> [iterations] [model_N.pt]"; exit 1; }
+    r=$(latest_run)
+    if [[ -n "$r" ]] && is_running "$r"; then echo "$r is still running; stop it first."; exit 1; fi
+    ck=${4:-$(ls "$RUNS/$src"/model_*.pt 2>/dev/null | sed 's#.*/##' | sort -t_ -k2 -n | tail -1)}
+    [[ -n "$ck" && -f "$RUNS/$src/$ck" ]] || { echo "no checkpoint '$ck' in $RUNS/$src"; exit 1; }
+    source "$RUNS/$src/run.cfg"
+    case $env in $VISION_ENV) kind=vision ;; $PLACE_ENV) kind=place ;; *) kind=state ;; esac
+    echo "Fine-tuning from $src/$ck (policy weights; the critic starts fresh for the current rewards)"
+    launch "so101_${kind}_ft_$(date +%Y%m%d_%H%M%S)" "$env" "$nworld" "${3:-2000}" "$src/$ck" ;;
   status)
     set +e +o pipefail   # missing log lines are normal here, not errors
     run=$(latest_run); [[ -n "$run" ]] || { echo "no runs yet"; exit 0; }
@@ -202,5 +220,5 @@ PY
     vmpy -m $DEPLOY_MOD --mode="$mode" --task="$task" \
       --checkpoint="../$RUNS/$run" --camera_width=$WRIST_CAM_W --camera_height=$WRIST_CAM_H \
       --mcap_log_dir="../$RUNS/$run/deploy_logs" "${@:4}" ;;
-  *) sed -n '2,20p' "$0"; exit 1 ;;
+  *) sed -n '2,23p' "$0"; exit 1 ;;
 esac
