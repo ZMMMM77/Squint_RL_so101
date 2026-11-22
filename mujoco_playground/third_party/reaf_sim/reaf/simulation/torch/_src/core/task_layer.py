@@ -1,0 +1,403 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Task layer for the Robotics Environment Authoring Framework."""
+
+from collections.abc import Mapping
+from collections.abc import Sequence
+import itertools
+from typing import Any
+from typing import Protocol
+
+from dm_env import specs
+from gdm_robotics.interfaces import types as gdmr_types
+import numpy as np
+from reaf.core import commands_processor as core_commands_processor
+from reaf.core import features_observer as core_features_observer
+from reaf.core import logger as logger_module
+from reaf.simulation.torch._src.common import default_discount_provider
+from reaf.simulation.torch._src.common import zero_reward_provider
+from reaf.simulation.torch._src.core import discount_provider as torch_discount_provider
+from reaf.simulation.torch._src.core import feature_producer as feature_producer_module
+from reaf.simulation.torch._src.core import metric_provider as torch_metric_provider
+from reaf.simulation.torch._src.core import reward_provider as torch_reward_provider
+from reaf.simulation.torch._src.core import termination_checker as core_termination_checker
+import torch
+
+
+class _ResettableObject(Protocol):
+  """Protocol for an object that can be reset."""
+
+  def reset(self, *args, **kwargs) -> None:
+    ...
+
+
+class TaskLayer:
+  """Torch-compatible version of the REAF TaskLayer class."""
+
+  def __init__(  # pylint: disable=useless-parent-delegation
+      self,
+      *,
+      commands_processors: Sequence[core_commands_processor.CommandsProcessor],
+      features_producers: Sequence[feature_producer_module.FeatureProducer],
+      termination_checkers: Sequence[
+          core_termination_checker.TerminationChecker
+      ],
+      reward_provider: torch_reward_provider.RewardProvider | None = None,
+      metric_provider: torch_metric_provider.MetricProvider | None = None,
+      discount_provider: torch_discount_provider.DiscountProvider | None = None,
+      features_observers: Sequence[
+          core_features_observer.FeaturesObserver
+      ] = (),
+      loggers: Sequence[logger_module.Logger] = (),
+      xpu_device: str = "cuda:0",
+      nworld: int = 1,
+  ):
+    self._commands_processors = commands_processors
+    self._features_producers = features_producers
+    self._reward_provider = (
+        reward_provider
+        if reward_provider
+        else zero_reward_provider.ZeroRewardProvider(
+            nworld=nworld, xpu_device=xpu_device, name="zero_reward"
+        )
+    )
+    self._metric_provider = metric_provider
+    self._termination_checkers = termination_checkers
+    self._discount_provider = (
+        discount_provider
+        if discount_provider
+        else default_discount_provider.DefaultDiscountProvider(
+            nworld=nworld, xpu_device=xpu_device
+        )
+    )
+    self._features_observers = features_observers
+    self._loggers = list(loggers)
+
+    for producer in self._features_producers:
+      if not isinstance(producer, feature_producer_module.FeatureProducer):
+        raise TypeError(
+            "Feature producers must derive from"
+            " `reaf.simulation.torch.FeatureProducer`, got"
+            f" {type(producer).__name__}."
+        )
+    self._all_env_mask = torch.ones(nworld, dtype=torch.bool, device=xpu_device)
+
+    # We make a set of all resettable objects so that these objects only get
+    # their resets called once. This is important for e.g. when having a single
+    # object that derives from two interfaces.
+    self._resettable_objects: list[_ResettableObject] = []
+    unique_ids = set()
+    for resettable_object in itertools.chain(
+        self._commands_processors,
+        self._features_producers,
+        self._termination_checkers,
+        [self._reward_provider],
+        ([self._metric_provider] if self._metric_provider is not None else []),
+        [self._discount_provider],
+    ):
+      resettable_object_id = id(resettable_object)
+      if resettable_object_id not in unique_ids:
+        unique_ids.add(resettable_object_id)
+        self._resettable_objects.append(resettable_object)
+
+    self._nworld = nworld
+    self._termination_buffer: Any = torch.full(
+        (nworld,), fill_value=0, dtype=torch.int32, device=xpu_device
+    )
+
+    self._components_by_name = {}
+    all_components = (
+        list(features_producers)
+        + list(commands_processors)
+        + list(termination_checkers)
+        + list(features_observers)
+        + [reward_provider]
+    )
+
+    for c in all_components:
+      name_attr = getattr(c, "name", None)
+      if name_attr:
+        name = name_attr() if callable(name_attr) else name_attr
+        self._components_by_name[name] = c
+
+  def commands_spec(
+      self,
+      device_layer_commands_spec: (
+          Mapping[str, gdmr_types.AnyArraySpec] | None
+      ) = None,
+  ) -> Mapping[str, gdmr_types.AnyArraySpec]:
+    """Returns the commands spec exposed by the task layer."""
+    spec: dict[str, gdmr_types.AnyArraySpec] = dict(
+        device_layer_commands_spec or {}
+    )
+    for processor in reversed(self._commands_processors):
+      processor_produced_keys = processor.produced_commands_keys()
+      spec = {
+          key: value
+          for key, value in spec.items()
+          if key not in processor_produced_keys
+      }
+      for key, proc_spec in processor.consumed_commands_spec().items():
+        spec[key] = proc_spec.replace(shape=(self._nworld,) + proc_spec.shape)
+
+    return spec  # pyrefly: ignore[bad-return]
+
+  def features_spec(
+      self,
+      device_layer_measurements_spec: Mapping[str, specs.Array] | None = None,
+  ) -> dict[str, specs.Array]:
+    """Returns the features spec exposed by the task layer."""
+    spec = dict(device_layer_measurements_spec or {})
+    for features_producer in self._features_producers:
+      for k, v in features_producer.produced_features_spec().items():
+        spec[k] = v.replace(shape=(self._nworld,) + v.shape)
+    return spec
+
+  def validate_spec(
+      self,
+      *,
+      device_layer_commands_spec: (
+          Mapping[str, gdmr_types.AnyArraySpec] | None
+      ) = None,
+      device_layer_measurements_spec: Mapping[str, specs.Array] | None = None,
+  ) -> None:
+    """Checks that the specs have consistent keys.
+
+    Features producers run in order. Each producer can only require device
+    layer measurements and features of earlier producers, and must not produce
+    a key that already exists. Commands processors run in order from the policy
+    to the device layer. Each command that a processor produces must be
+    consumed by a later processor or by the device layer.
+
+    Args:
+      device_layer_commands_spec: The commands spec of the device layer. `None`
+        is treated as an empty spec.
+      device_layer_measurements_spec: The measurements spec of the device layer.
+        `None` is treated as an empty spec.
+
+    Raises:
+      ValueError: If a features producer or a commands processor does not match
+        the device layer specs or its position in the processing chain.
+    """
+    self._validate_features_spec(device_layer_measurements_spec or {})
+    self._validate_commands_spec(device_layer_commands_spec or {})
+
+  def _validate_features_spec(
+      self, device_layer_measurements_spec: Mapping[str, specs.Array]
+  ) -> None:
+    """Checks the features producers against the available feature keys."""
+    available_keys = set(device_layer_measurements_spec)
+    for producer in self._features_producers:
+      missing_keys = set(producer.required_features_keys()) - available_keys
+      if missing_keys:
+        raise ValueError(
+            "Failed to validate features spec: features producer"
+            f" {producer.name!r} requires keys {sorted(missing_keys)} that are"
+            " not device layer measurements or features of earlier features"
+            " producers."
+        )
+      produced_keys = set(producer.produced_features_spec())
+      duplicate_keys = produced_keys & available_keys
+      if duplicate_keys:
+        raise ValueError(
+            "Failed to validate features spec: features producer"
+            f" {producer.name!r} produces keys {sorted(duplicate_keys)} that"
+            " are already device layer measurements or features of earlier"
+            " features producers."
+        )
+      available_keys |= produced_keys
+
+  def _validate_commands_spec(
+      self, device_layer_commands_spec: Mapping[str, gdmr_types.AnyArraySpec]
+  ) -> None:
+    """Checks the commands processors against the consumable command keys."""
+    # Propagate the consumable keys from the device layer up to the policy.
+    consumable_keys = set(device_layer_commands_spec)
+    for processor in reversed(self._commands_processors):
+      produced_keys = set(processor.produced_commands_keys())
+      unconsumed_keys = produced_keys - consumable_keys
+      if unconsumed_keys:
+        raise ValueError(
+            "Failed to validate commands spec: commands processor"
+            f" {processor.name!r} produces keys {sorted(unconsumed_keys)} that"
+            " are not consumed by later commands processors or the device"
+            " layer."
+        )
+      consumable_keys -= produced_keys
+      consumable_keys |= set(processor.consumed_commands_spec())
+
+  def reward_spec(self):
+    """Returns the reward spec exposed by the task layer."""
+    return self._reward_provider.reward_spec()
+
+  def discount_spec(self):
+    """Returns the discount spec exposed by the task layer."""
+    return self._discount_provider.discount_spec()
+
+  def perform_reset(self, env_mask: torch.Tensor | None = None) -> None:
+    """Reset the internal state of the task layer."""
+    if env_mask is None:
+      env_mask = self._all_env_mask
+    for resettable_object in self._resettable_objects:
+      resettable_object.reset(env_mask)
+
+  def check_for_termination(
+      self, features: Mapping[str, torch.Tensor]
+  ) -> torch.Tensor:
+    """Checks for termination."""
+    self._termination_buffer[:] = (
+        core_termination_checker.TerminationResult.DO_NOT_TERMINATE
+    )
+    for termination_checker in self._termination_checkers:
+      term = termination_checker.check_termination(features)
+      self._termination_buffer.copy_(
+          core_termination_checker.TerminationResult.combine(
+              self._termination_buffer,  # pyrefly: ignore[bad-argument-type]
+              term,  # pyrefly: ignore[bad-argument-type]
+          )
+      )
+    return self._termination_buffer
+
+  def compute_reward(
+      self, features: Mapping[str, torch.Tensor]
+  ) -> torch_reward_provider.RewardValue:
+    """Computes the reward given the features."""
+    return self._reward_provider.compute_reward(features)
+
+  def update_metrics(self, features: Mapping[str, torch.Tensor]) -> None:
+    """Evaluates per-step metrics and updates internal episodic accumulators.
+
+    Modifies internal state; should only be called once per control step by
+    `Environment.step`.
+    """
+    if self._metric_provider is None:
+      return
+    self._metric_provider.update_metrics(features)
+
+  def get_episode_metrics(
+      self,
+      env_mask: torch.Tensor,
+  ) -> dict[str, torch.Tensor]:
+    """Returns 0-D mean reduced episode metrics over the masked worlds.
+
+    Read-only; does not modify internal state.
+    """
+    if self._metric_provider is None:
+      return {}
+    return self._metric_provider.get_episode_metrics(env_mask)
+
+  def compute_discount(
+      self,
+      features: Mapping[str, torch.Tensor],
+      terminations: torch.Tensor,
+  ) -> torch.Tensor:
+    """Computes the discount given the features and terminations."""
+    return self._discount_provider.compute_discount(features, terminations)
+
+  def compute_all_features(
+      self, measurements: Mapping[str, torch.Tensor]
+  ) -> Mapping[str, torch.Tensor]:
+    """Advances the producers by one control step and computes all features.
+
+    Calls each producer's `on_step()` right before its `produce_features()`.
+    Should be called once per control step. `Environment.step()` does this for
+    you; code that uses the task layer directly must do it itself.
+
+    Args:
+      measurements: The device layer measurements after the physics step.
+
+    Returns:
+      All the task layer features.
+    """
+    features = dict(measurements)
+    for producer in self._features_producers:
+      required = {k: features[k] for k in producer.required_features_keys()}
+      producer.on_step(required)
+      features.update(producer.produce_features(required))
+    return features
+
+  def begin_stepping_features(
+      self,
+      measurements: Mapping[str, torch.Tensor],
+      env_mask: torch.Tensor | None = None,
+  ) -> Mapping[str, torch.Tensor]:
+    """Records the reset state of the `env_mask` worlds and computes features.
+
+    Calls each producer's `on_begin_stepping()` right before its
+    `produce_features()`. Worlds outside `env_mask` keep their producer state,
+    so their features are the same as before the reset.
+
+    Args:
+      measurements: The device layer measurements of the reset state.
+      env_mask: Boolean mask of the reset worlds. None: all worlds.
+
+    Returns:
+      All the task layer features.
+    """
+    if env_mask is None:
+      env_mask = self._all_env_mask
+    features = dict(measurements)
+    for producer in self._features_producers:
+      required = {k: features[k] for k in producer.required_features_keys()}
+      producer.on_begin_stepping(required, env_mask)
+      features.update(producer.produce_features(required))
+    return features
+
+  def record(
+      self,
+      measurements: Mapping[str, torch.Tensor],
+      features: Mapping[str, torch.Tensor],
+  ) -> None:
+    """Passes measurements and features to the observers and loggers.
+
+    Args:
+      measurements: The device layer measurements.
+      features: All the task layer features.
+    """
+    for logger in self._loggers:
+      logger.record_measurements(measurements)
+    for observer in self._features_observers:
+      observer.observe_features(features)
+    for logger in self._loggers:
+      logger.record_features(features)
+
+  def compute_final_commands(
+      self, commands: Mapping[str, torch.Tensor]
+  ) -> Mapping[str, torch.Tensor]:
+    """Computes final commands by running commands through all processors."""
+    current_commands = dict(commands)
+    for processor in self._commands_processors:
+      consumed_commands = {
+          k: current_commands.pop(k)
+          for k in processor.consumed_commands_spec().keys()
+      }
+      produced_commands = processor.process_commands(consumed_commands)
+      current_commands.update(produced_commands)
+    return current_commands
+
+  def add_logger(self, logger: logger_module.Logger) -> None:
+    """Adds a logger to the task layer."""
+    self._loggers.append(logger)
+
+  def remove_logger(self, logger: logger_module.Logger) -> None:
+    """Removes a logger from the task layer."""
+    self._loggers.remove(logger)
+
+  def get_component_by_name(self, name: str):
+    """Retrieves a component by its name."""
+    return self._components_by_name[name]
+
+  def has_component(self, name: str) -> bool:
+    """Checks if a component with the given name exists."""
+    return name in self._components_by_name

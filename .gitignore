@@ -1,0 +1,21 @@
+# Training runs (checkpoints, train.log, TensorBoard events, deploy logs) stay local.
+runs/
+
+# MuJoCo runtime warnings log
+MUJOCO_LOG.TXT
+
+# Python / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Note: mujoco_playground/.local/ (this arm's calibration, serial port, camera
+# paths) is committed on purpose as a backup of the real-robot setup.

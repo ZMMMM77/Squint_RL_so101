@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Run a command from this VM project on the RTX 3060 in WSL2.
+# The code stays in the VM: WSL2 mounts this folder over sshfs and runs the
+# command inside mujoco_playground/ with the venv ~/.venvs/playground-gpu.
+# Outputs (logs, checkpoints) are written straight back into this VM folder.
+#
+# Usage (from the VM, in ~/Squint_RL_so101):
+#   ./wsl-gpu python -m mujoco_playground.rl.rsl_rl.train --env=SO101PickCube ...
+#   ./wsl-gpu nvidia-smi
+#   ./wsl-gpu --stop [JOB_ID]  # stop wsl-gpu jobs on WSL2 (all of them if no id)
+# Ctrl+C stops only the job started by that call. Set WSL_GPU_JOB_ID to name a job.
+set -euo pipefail
+
+WIN=ZMMM@192.168.146.1
+DISTRO=Ubuntu-22.04
+VM_HOST=zmmm@192.168.146.135
+VM_PROJECT=/home/zmmm/Squint_RL_so101
+WSL_MOUNT=/home/sam/mnt/Squint_RL_so101
+VENV=/home/sam/.venvs/playground-gpu
+JOB_ID=${WSL_GPU_JOB_ID:-job$(date +%s%N)}
+
+wsl() {  # run the bash script given on stdin inside WSL2
+  ssh -i ~/.ssh/drift_windows_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes \
+      -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+      "$WIN" "wsl.exe -d $DISTRO --exec bash -s"
+}
+
+stop_remote() {  # $1: job id, or empty for every wsl-gpu job
+  echo "[wsl-gpu] stopping WSL2 job ${1:-(all)}..." >&2
+  wsl <<EOF
+want="${1:-}"
+pids=""
+for d in /proc/[0-9]*; do
+  id=\$( { tr '\0' '\n' < \$d/environ; } 2>/dev/null | sed -n 's/^WSL_GPU_JOB=//p')
+  [ -n "\$id" ] && { [ -z "\$want" ] || [ "\$id" = "\$want" ]; } && pids="\$pids \${d#/proc/}"
+done
+[ -z "\$pids" ] && { echo "[wsl-gpu] nothing running"; exit 0; }
+kill -INT \$pids 2>/dev/null; sleep 5
+kill -TERM \$pids 2>/dev/null; true
+EOF
+}
+
+if [[ "${1:-}" == "--stop" ]]; then stop_remote "${2:-}"; exit 0; fi
+if [[ $# -eq 0 ]]; then sed -n '2,11p' "$0"; exit 1; fi
+
+cmd=$(printf '%q ' "$@")
+trap 'stop_remote "$JOB_ID"; exit 130' INT TERM
+
+wsl <<EOF
+set -e
+# A dead sshfs mount makes every access to it hang, so only touch the mount
+# through 'timeout', and remount when it doesn't answer.
+mount_ok() { timeout 5 test -d $WSL_MOUNT/mujoco_playground; }
+if ! mount_ok; then
+  fusermount -uz $WSL_MOUNT 2>/dev/null || true
+  for p in \$(pgrep -f "^sshfs $VM_HOST:$VM_PROJECT "); do kill -9 \$p; done
+  mkdir -p $WSL_MOUNT
+  # setsid: keep sshfs and its ssh child alive after this WSL session ends
+  # (otherwise the ssh child is killed with the session and the mount hangs).
+  setsid -f sshfs $VM_HOST:$VM_PROJECT $WSL_MOUNT \
+    -o IdentityFile=/home/sam/.ssh/drift_vm_ed25519,StrictHostKeyChecking=yes,BatchMode=yes \
+    -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3 \
+    -o dir_cache=no,attr_timeout=0,entry_timeout=0,idmap=user </dev/null >/dev/null 2>&1
+  for i in 1 2 3 4 5 6 7 8 9 10; do mount_ok && break; sleep 1; done
+  mount_ok || { echo "[wsl-gpu] could not mount the VM project in WSL2" >&2; exit 1; }
+fi
+export PATH=/home/sam/.local/bin:\$PATH
+export UV_PROJECT_ENVIRONMENT=$VENV
+[ -f $VENV/bin/activate ] && source $VENV/bin/activate
+cd $WSL_MOUNT/mujoco_playground
+export PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+export LD_LIBRARY_PATH=/usr/lib/wsl/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}
+export WSL_GPU_JOB=$JOB_ID   # marker used by --stop to find this job
+exec $cmd
+EOF

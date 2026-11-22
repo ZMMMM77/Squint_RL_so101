@@ -1,0 +1,43 @@
+{
+  "follower": {
+    "elbow_flex": {
+      "id": 3,
+      "range_max": 3108,
+      "range_min": 904,
+      "zero": 2047
+    },
+    "gripper": {
+      "id": 6,
+      "range_max": 3634,
+      "range_min": 2025,
+      "zero": 2047
+    },
+    "shoulder_lift": {
+      "id": 2,
+      "range_max": 3277,
+      "range_min": 808,
+      "zero": 2047
+    },
+    "shoulder_pan": {
+      "id": 1,
+      "range_max": 3046,
+      "range_min": 1045,
+      "zero": 2047
+    },
+    "wrist_flex": {
+      "id": 4,
+      "range_max": 3169,
+      "range_min": 833,
+      "zero": 2047
+    },
+    "wrist_roll": {
+      "id": 5,
+      "range_max": 4095,
+      "range_min": 0,
+      "zero": 2047
+    }
+  },
+  "serials": {
+    "follower": "5B3E088809"
+  }
+}
